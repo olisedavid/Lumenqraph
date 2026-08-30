@@ -494,10 +494,21 @@ impl RpcClient {
 
     /// Reset and return the accumulated RPC metrics from this client instance.
     /// Used by the indexer to report metrics periodically.
+    ///
+    /// Memory ordering rationale:
+    ///   - `fetch_add` on the counter paths uses `Relaxed` because counter
+    ///     increments are independent — we only care about the final aggregate,
+    ///     not any ordering relative to other memory operations.
+    ///   - `swap(0, Acquire)` here ensures that all preceding `Relaxed`
+    ///     `fetch_add` operations on *this thread* (and any thread that
+    ///     synchronised with this one) are visible before the counters are
+    ///     reset. This prevents a stale read where increments that happened
+    ///     before the swap are not yet visible to the Prometheus reporter on
+    ///     weakly-ordered architectures such as ARM.
     pub fn take_metrics(&self) -> (u64, u64, u64) {
-        let calls = self.calls_made.swap(0, std::sync::atomic::Ordering::Relaxed);
-        let errors = self.calls_failed.swap(0, std::sync::atomic::Ordering::Relaxed);
-        let errors_32001 = self.calls_failed_32001.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let calls = self.calls_made.swap(0, std::sync::atomic::Ordering::Acquire);
+        let errors = self.calls_failed.swap(0, std::sync::atomic::Ordering::Acquire);
+        let errors_32001 = self.calls_failed_32001.swap(0, std::sync::atomic::Ordering::Acquire);
         (calls, errors, errors_32001)
     }
 

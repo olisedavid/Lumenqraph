@@ -26,20 +26,27 @@ use crate::state::AppState;
 
 #[derive(Deserialize)]
 pub struct ContractsQuery {
+    /// Maximum number of contracts to return. Default 100, max 1000.
     #[serde(default = "default_limit")]
     limit: i64,
+    /// Cursor-based pagination: the `contract_id` returned as `next_cursor`
+    /// from a previous response. When supplied, returns contracts whose
+    /// `contract_id` sorts after this value (within the same event-count order).
     #[serde(default)]
-    offset: i64,
+    after: Option<String>,
 }
 
 fn default_limit() -> i64 {
-    200
+    100
 }
 
 #[derive(Serialize)]
 pub struct ContractsResponse {
     pub data: Vec<Contract>,
     pub has_more: bool,
+    /// The `after` value to pass on the next request to continue pagination.
+    /// `null` when there are no more pages.
+    pub next_cursor: Option<String>,
 }
 
 pub async fn list_contracts(
@@ -50,34 +57,77 @@ pub async fn list_contracts(
     // instead of computing a GROUP BY on every request. This provides constant-time
     // performance independent of the total event count, making the explorer's landing
     // page (which relies on this endpoint) performant at scale.
-    let limit = q.limit.clamp(1, 500);
-    let offset = q.offset.max(0);
+    //
+    // Cursor pagination: when `after` is provided, resolve the event_count of the
+    // cursor row and continue from there. Ties in event_count are broken by
+    // contract_id (lexicographic), which gives a stable total order without a
+    // sequential scan.
+    let limit = q.limit.clamp(1, 1000);
 
-    let contracts: Vec<Contract> = sqlx::query_as(
-        "SELECT contract_id,
-                event_count,
-                first_seen_ledger,
-                last_seen_ledger
-         FROM contract_summaries
-         WHERE event_count > 0
-         ORDER BY event_count DESC
-         LIMIT $1 OFFSET $2",
-    )
-    .bind(limit + 1)
-    .bind(offset)
-    .fetch_all(&state.pool)
-    .await?;
+    let contracts: Vec<Contract> = if let Some(ref cursor) = q.after {
+        // Look up the event_count of the cursor contract so we can use a
+        // keyset predicate instead of OFFSET, keeping the query O(log N).
+        let cursor_count: Option<i64> = sqlx::query_scalar(
+            "SELECT event_count FROM contract_summaries WHERE contract_id = $1",
+        )
+        .bind(cursor)
+        .fetch_optional(&state.pool)
+        .await?;
+
+        match cursor_count {
+            Some(cc) => sqlx::query_as(
+                "SELECT contract_id,
+                        event_count,
+                        first_seen_ledger,
+                        last_seen_ledger
+                 FROM contract_summaries
+                 WHERE event_count > 0
+                   AND (event_count < $1
+                        OR (event_count = $1 AND contract_id > $2))
+                 ORDER BY event_count DESC, contract_id ASC
+                 LIMIT $3",
+            )
+            .bind(cc)
+            .bind(cursor)
+            .bind(limit + 1)
+            .fetch_all(&state.pool)
+            .await?,
+            // Unknown cursor — return empty rather than silently restarting.
+            None => vec![],
+        }
+    } else {
+        sqlx::query_as(
+            "SELECT contract_id,
+                    event_count,
+                    first_seen_ledger,
+                    last_seen_ledger
+             FROM contract_summaries
+             WHERE event_count > 0
+             ORDER BY event_count DESC, contract_id ASC
+             LIMIT $1",
+        )
+        .bind(limit + 1)
+        .fetch_all(&state.pool)
+        .await?
+    };
 
     let has_more = contracts.len() as i64 > limit;
-    let result_contracts = if has_more {
+    let result_contracts: Vec<Contract> = if has_more {
         contracts.into_iter().take(limit as usize).collect()
     } else {
         contracts
     };
 
+    let next_cursor = if has_more {
+        result_contracts.last().map(|c| c.contract_id.clone())
+    } else {
+        None
+    };
+
     Ok(Json(ContractsResponse {
         data: result_contracts,
         has_more,
+        next_cursor,
     }))
 }
 

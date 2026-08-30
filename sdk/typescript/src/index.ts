@@ -98,6 +98,13 @@ export interface DataKeyHistory {
   versions: { ledger: number; value: Json; captured_at: string }[];
 }
 
+export interface ContractsResponse {
+  data: Contract[];
+  has_more: boolean;
+  /** Pass as `after` on the next call to fetch the next page. `null` when no more pages. */
+  next_cursor: string | null;
+}
+
 export interface EventsResponse {
   data: EventRecord[];
   has_more: boolean;
@@ -237,9 +244,15 @@ export class LumenqraphClient {
     return this.get("/health", {}, opts.signal);
   }
 
-  /** Contracts the indexer has seen, with per-contract event counts. */
-  listContracts(opts: RequestOptions = {}): Promise<Contract[]> {
-    return this.get("/contracts", {}, opts.signal);
+  /**
+   * Contracts the indexer has seen, with per-contract event counts.
+   * Supports cursor-based pagination: pass the `next_cursor` from a previous
+   * response as `after` to fetch the next page.
+   */
+  listContracts(
+    opts: { limit?: number; after?: string; signal?: AbortSignal } = {},
+  ): Promise<ContractsResponse> {
+    return this.get("/contracts", { limit: opts.limit, after: opts.after }, opts.signal);
   }
 
   /** A contract's decoded on-chain interface (functions, events, types). */

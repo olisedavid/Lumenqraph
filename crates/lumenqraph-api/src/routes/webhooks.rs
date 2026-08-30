@@ -440,6 +440,68 @@ pub async fn redrive_webhook(
     })))
 }
 
+/// `POST /webhooks/:id/rotate-secret`
+///
+/// Generates a new HMAC signing secret for the subscription and returns it
+/// **once** (it is never retrievable again). The previous secret remains valid
+/// for a configurable grace period (`WEBHOOK_SECRET_GRACE_SECS`, default 300 s)
+/// so consumers can update their configuration without a gap in verified
+/// deliveries. After the grace period the old secret is discarded.
+///
+/// This operation does **not** reset the delivery watermark or cause any
+/// deliveries to be replayed — subscription history is fully preserved.
+pub async fn rotate_webhook_secret(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<Value>> {
+    // Verify the subscription exists.
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM webhook_subscriptions WHERE id = $1)")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await?;
+    if !exists {
+        return Err(ApiError::not_found("subscription not found"));
+    }
+
+    let new_secret = random_secret();
+    let encryption_key = std::env::var("WEBHOOK_ENCRYPTION_KEY")
+        .unwrap_or_else(|_| "default-key-for-testing".to_string());
+
+    // Grace period: how long (seconds) the old secret stays valid alongside the new one.
+    let grace_secs: i64 = std::env::var("WEBHOOK_SECRET_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
+
+    // Store the new secret and move the current secret into `previous_encrypted_secret`
+    // with an expiry timestamp. The delivery service validates against both secrets
+    // until `previous_secret_expires_at` passes.
+    sqlx::query(
+        "UPDATE webhook_subscriptions
+         SET previous_encrypted_secret   = encrypted_secret,
+             previous_secret_expires_at  = now() + ($1 * interval '1 second'),
+             encrypted_secret            = pgp_sym_encrypt($2, $3)
+         WHERE id = $4",
+    )
+    .bind(grace_secs)
+    .bind(&new_secret)
+    .bind(&encryption_key)
+    .bind(id)
+    .execute(&state.pool)
+    .await?;
+
+    log_webhook_action(&state.pool, "webhook_rotate_secret", &id.to_string()).await;
+
+    Ok(Json(serde_json::json!({
+        "id": id,
+        "secret": new_secret,
+        "previous_secret_valid_until": chrono::Utc::now()
+            + chrono::Duration::seconds(grace_secs),
+        "message": "Store this secret immediately — it will not be shown again.",
+    })))
+}
+
 pub async fn reenable_webhook(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,

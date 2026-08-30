@@ -113,6 +113,42 @@ When deploying Lumenqraph in production:
    
    Note: The plaintext `secret` column is retained for backward compatibility during rolling deployments. A future migration will drop it once all instances are updated.
 
+### Webhook Signing Secret Rotation
+
+To rotate a subscription's signing secret without losing delivery history or resetting the watermark, use the dedicated rotation endpoint:
+
+```bash
+curl -X POST https://<host>/webhooks/<subscription-id>/rotate-secret \
+  -H "x-api-key: <your-api-key>"
+```
+
+The response contains the new secret (shown **once only**) and the timestamp until which the previous secret remains valid:
+
+```json
+{
+  "id": "...",
+  "secret": "<new-hex-secret>",
+  "previous_secret_valid_until": "2025-01-24T12:05:00Z",
+  "message": "Store this secret immediately — it will not be shown again."
+}
+```
+
+**Rotation procedure:**
+
+1. Call `POST /webhooks/:id/rotate-secret` and capture the new secret immediately.
+2. Update your consumer to accept both the old and new secrets during the grace period (`WEBHOOK_SECRET_GRACE_SECS`, default 300 seconds). The server validates deliveries signed with either secret during this window.
+3. After the grace period expires, retire the old secret from your consumer — only the new one will be valid.
+
+The grace period avoids a verification gap: in-flight deliveries signed with the old secret are still accepted while you roll out the updated secret to your infrastructure.
+
+**Environment configuration:**
+
+```bash
+# Grace period during which the old secret stays valid alongside the new one (seconds).
+# Default: 300 (5 minutes). Increase for slower rollouts.
+WEBHOOK_SECRET_GRACE_SECS=300
+```
+
 ### For Developers
 
 When contributing to Lumenqraph:

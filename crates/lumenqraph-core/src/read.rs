@@ -62,8 +62,10 @@ pub struct EncodedCall {
 ///
 /// `spec_section` is the raw `contractspecv0` XDR (as captured at index time).
 /// `args` is either a JSON object keyed by parameter name, or a positional JSON
-/// array. `source_account` is an optional `G…` account to use as the tx source
-/// (defaults to the zero account, which simulation accepts for read-only calls).
+/// array. `source_account` is an optional `G…` or `M…` strkey to use as the tx
+/// source (defaults to the zero account, which simulation accepts for read-only
+/// calls). Both plain Ed25519 public keys (`G…`) and muxed accounts (`M…`) are
+/// accepted.
 pub fn encode_call(
     spec_section: &[u8],
     contract_id: &str,
@@ -275,6 +277,10 @@ fn json_to_scval(
         // `Val` is untyped by definition, and Result/Error/MuxedAddress aren't
         // things a view function takes as input in practice. Left as a clear
         // client error rather than a guess.
+        //
+        // Note: MuxedAccount (M… strkey) *is* supported as the `source_account`
+        // argument to `/call` and `/simulate`, but not as a typed function
+        // parameter in the contract spec.
         T::Val | T::Result(_) | T::Error | T::MuxedAddress => {
             return Err(unsupported());
         }
@@ -546,6 +552,25 @@ fn union_to_scval(
     }
 }
 
+/// Parse a `G…` or `M…` strkey into a `MuxedAccount` for use as a simulation
+/// transaction source.
+///
+/// - `G…` (StrKey Ed25519 public key) → `MuxedAccount::Ed25519`
+/// - `M…` (StrKey muxed account)      → `MuxedAccount::MuxedEd25519`
+///
+/// Any other format is rejected by the underlying XDR parser and surfaced as
+/// a `Build` error to the caller.
+fn parse_source_account(s: &str) -> Result<MuxedAccount, stellar_xdr::curr::Error> {
+    // Try muxed account first (M… prefix); fall back to plain G… public key.
+    if s.starts_with('M') {
+        MuxedAccount::from_str(s)
+    } else {
+        match PublicKey::from_str(s)? {
+            PublicKey::PublicKeyTypeEd25519(k) => Ok(MuxedAccount::Ed25519(k)),
+        }
+    }
+}
+
 fn build_read_tx(
     contract_id: &str,
     function: &str,
@@ -553,9 +578,7 @@ fn build_read_tx(
     source_account: Option<&str>,
 ) -> Result<String, stellar_xdr::curr::Error> {
     let source = match source_account {
-        Some(g) => match PublicKey::from_str(g)? {
-            PublicKey::PublicKeyTypeEd25519(k) => MuxedAccount::Ed25519(k),
-        },
+        Some(s) => parse_source_account(s)?,
         None => MuxedAccount::Ed25519(ZERO_ACCOUNT),
     };
 
@@ -897,6 +920,57 @@ mod tests {
         let spec = balance_spec();
         let call = encode_call(&spec, C, "balance", &serde_json::json!([G]), None);
         assert!(call.is_ok());
+    }
+
+    // A valid M-strkey: the minimal muxed-account encoding of the all-zero key
+    // with sub-account id 0.
+    const M: &str = "MA7QYNF7SOWQ3GLR2BGMZEHXR776WJRK76K2GS4K4BRZ4LHE4AAAAAAAAAAPCIBVZA";
+
+    #[test]
+    fn muxed_account_source_is_accepted() {
+        let spec = balance_spec();
+        let call = encode_call(&spec, C, "balance", &serde_json::json!({ "id": G }), Some(M))
+            .expect("M-strkey source_account should be accepted");
+        // Decode the envelope and verify the source is a MuxedEd25519 account.
+        let env = TransactionEnvelope::from_xdr_base64(&call.tx_xdr, Limits::none()).unwrap();
+        let TransactionEnvelope::Tx(v1) = env else {
+            panic!("expected v1 envelope")
+        };
+        assert!(
+            matches!(v1.tx.source_account, MuxedAccount::MuxedEd25519(_)),
+            "expected MuxedEd25519 source, got {:?}",
+            v1.tx.source_account
+        );
+    }
+
+    #[test]
+    fn g_strkey_source_still_works() {
+        let spec = balance_spec();
+        let call = encode_call(&spec, C, "balance", &serde_json::json!({ "id": G }), Some(G))
+            .expect("G-strkey source_account should still be accepted");
+        let env = TransactionEnvelope::from_xdr_base64(&call.tx_xdr, Limits::none()).unwrap();
+        let TransactionEnvelope::Tx(v1) = env else {
+            panic!("expected v1 envelope")
+        };
+        assert!(
+            matches!(v1.tx.source_account, MuxedAccount::Ed25519(_)),
+            "expected Ed25519 source, got {:?}",
+            v1.tx.source_account
+        );
+    }
+
+    #[test]
+    fn invalid_source_account_is_a_build_error() {
+        let spec = balance_spec();
+        let err = encode_call(
+            &spec,
+            C,
+            "balance",
+            &serde_json::json!({ "id": G }),
+            Some("not-a-strkey"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, EncodeError::Build(_)));
     }
 
     #[test]

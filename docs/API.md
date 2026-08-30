@@ -298,6 +298,8 @@ probably safe via `/call`; when in doubt, or when `is_view` is `false`, prefer
 Invoke a **view** function read-only and return a typed result.
 Body: `{ "function": "balance", "args": { "id": "G..." }, "source_account": null }`
 — `args` takes an object keyed by parameter name, or a positional array.
+`source_account` accepts both a plain Ed25519 public key (`G…` strkey) and a
+muxed account (`M…` strkey) for sub-account routing.
 ```json
 { "contract_id": "CB...", "function": "balance",
   "result": "500", "simulated_at_ledger": 3550886 }
@@ -487,6 +489,24 @@ detecting whether another page exists.
 
 ### `DELETE /webhooks/:id`
 Removes a subscription (and cascades its deliveries).
+
+### `POST /webhooks/:id/rotate-secret`
+Rotates the HMAC signing secret for a subscription. Returns the new secret
+**once only** — store it immediately. The previous secret remains valid for a
+configurable grace period (default 5 minutes, set via `WEBHOOK_SECRET_GRACE_SECS`)
+so consumers can roll out the new secret without a verification gap.
+
+```json
+{
+  "id": "...",
+  "secret": "<new-hex-secret>",
+  "previous_secret_valid_until": "2025-01-24T12:05:00Z",
+  "message": "Store this secret immediately — it will not be shown again."
+}
+```
+
+Delivery history and the subscription watermark are fully preserved — no
+deliveries are replayed and no events are missed.
 
 ### Verifying a delivery
 `HMAC-SHA256(secret, raw_request_body)` hex must equal the value after
